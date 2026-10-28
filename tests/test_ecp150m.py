@@ -1,88 +1,135 @@
 """Tests for ECP-150M status decoding and discovery."""
 
+import datetime
+
 import pytest
 
 from jebao.const import MODEL_ECP150M, MODEL_MDP20000
 from jebao.discovery import JebaoDiscovery
-from jebao.ecp150m import ECP150MSegment, ECP150MStatus, Wave
+from jebao.ecp150m import (
+    AutoMode,
+    ECP150MSegment,
+    ECP150MStatus,
+    Fault,
+    Linkage,
+    Mode,
+)
 from jebao.exceptions import JebaoCommandError
 
-# Header and segments as read from the two pumps; the reads are 401 bytes, with
-# 0xEE filler up to byte 391 and a 9-byte tail that never changed between reads.
-# Pump 1: Linkage master, Sine, 30 %, frequency 100, feed 10 min
-MASTER = (
+# Full 401-byte statuses read from the two pumps
+# Pump 1: Program, Sine, current segment Sine 30 %, frequency 100, feed 10 min
+PUMP1 = (
     bytes.fromhex("04391e640a1e64000a0a0a00021e64010a000a0a021e6400")
     + b"\xee" * 368
     + bytes.fromhex("141805130004173400")
 )
-# Pump 2: Manual, Constant, 57 %, frequency 50, feed 20 min (feed likely running)
-MANUAL = (
+# Pump 2: Manual, Constant, 57 %, frequency 50, feed 20 min, feed running
+PUMP2 = (
     bytes.fromhex("00653932140064000900160003646400")
     + b"\xee" * 376
     + bytes.fromhex("1418051300041c2300")
 )
 
 
-def with_header(byte0: int, byte1: int) -> bytes:
-    return bytes([byte0, byte1]) + MANUAL[2:]
+def with_flags(flags: int) -> bytes:
+    return flags.to_bytes(2, "big") + PUMP2[2:]
+
+
+def test_pump1_program():
+    status = ECP150MStatus.from_bytes(PUMP1)
+    assert status.is_on
+    assert status.is_program_mode
+    assert status.is_auto_pulse_tide
+    assert not status.is_feed_active
+    assert status.mode is Mode.SINE
+    assert status.linkage is Linkage.INDEPENDENT
+    assert status.auto_mode is AutoMode.SINE
+    assert (status.flow, status.frequency, status.feed_time) == (30, 100, 10)
+    assert (status.auto_flow, status.auto_frequency) == (30, 100)
+    assert status.segments == (
+        ECP150MSegment(0, 10, 10, 10, 0, 2, 30, 100, 1),
+        ECP150MSegment(1, 10, 0, 10, 10, 2, 30, 100, 0),
+    )
+    assert status.segments[0].auto_mode is AutoMode.SINE
+    assert status.date == datetime.date(2024, 5, 19)
+    assert status.time == datetime.time(4, 23, 52)
+    assert status.faults == Fault(0)
+
+
+def test_pump2_manual_feed():
+    status = ECP150MStatus.from_bytes(PUMP2)
+    assert status.is_on
+    assert status.is_feed_active
+    assert not status.is_program_mode
+    assert status.mode is Mode.CONSTANT
+    assert status.linkage is Linkage.INDEPENDENT
+    assert status.auto_mode is AutoMode.STOP
+    assert (status.flow, status.frequency, status.feed_time) == (57, 50, 20)
+    assert status.segments == (ECP150MSegment(0, 9, 0, 22, 0, 3, 100, 100, 0),)
+    # Segment mode 0x03 is the app's red mode
+    assert status.segments[0].auto_mode is AutoMode.RANDOM
+    assert status.time == datetime.time(4, 28, 35)
+    assert status.raw == PUMP2
 
 
 def test_linkage_master():
-    status = ECP150MStatus.from_bytes(MASTER)
-    assert status.is_linkage_master
-    assert not status.is_linkage_slave
-    assert status.wave is Wave.SINE
-    assert (status.flow, status.frequency, status.feed_duration) == (30, 100, 10)
-    # 0x08 is set on the master, but it tracks the linked slave there
+    # Read once while pump 1 was switched to master
+    status = ECP150MStatus.from_bytes(with_flags(0x04B1))
+    assert status.linkage is Linkage.MASTER
     assert not status.is_program_mode
-    assert status.segments == (
-        ECP150MSegment(10, 10, 10, 0, 0x02, (30, 100), 1),
-        ECP150MSegment(10, 0, 10, 10, 0x02, (30, 100), 0),
-    )
+    assert status.mode is Mode.SINE
 
 
-def test_manual():
-    status = ECP150MStatus.from_bytes(MANUAL)
-    assert not status.is_linkage_master
-    assert not status.is_linkage_slave
-    assert status.wave is Wave.CONSTANT
-    assert (status.flow, status.frequency, status.feed_duration) == (57, 50, 20)
-    assert not status.is_program_mode
-    assert status.is_feed_active
-    assert status.is_on
-    assert status.segments == (ECP150MSegment(9, 0, 22, 0, 0x03, (100, 100), 0),)
-    assert status.raw == MANUAL
-
-
-@pytest.mark.parametrize("byte0", [0x01, 0x07])
-def test_linkage_slave(byte0):
-    status = ECP150MStatus.from_bytes(with_header(byte0, 0x21))
-    assert status.is_linkage_slave
-    assert not status.is_linkage_master
+@pytest.mark.parametrize("flags,auto_mode", [(0x0121, AutoMode.STOP), (0x0721, AutoMode.RANDOM)])
+def test_linkage_slave(flags, auto_mode):
+    # Pump 2 as slave read with both words; only bits 9-11 differ
+    status = ECP150MStatus.from_bytes(with_flags(flags))
+    assert status.linkage is Linkage.SLAVE
+    assert status.auto_mode is auto_mode
+    assert status.mode is Mode.SINE
 
 
 @pytest.mark.parametrize(
-    "byte1,wave", [(0x21, Wave.SINE), (0x41, Wave.RANDOM), (0x61, Wave.CONSTANT), (0x01, None)]
+    "flags,mode",
+    [(0x01, Mode.CLASSIC), (0x21, Mode.SINE), (0x41, Mode.RANDOM), (0x61, Mode.CONSTANT)],
 )
-def test_wave_bits(byte1, wave):
-    assert ECP150MStatus.from_bytes(with_header(0x00, byte1)).wave is wave
+def test_mode_bits(flags, mode):
+    assert ECP150MStatus.from_bytes(with_flags(flags)).mode is mode
 
 
-def test_program_mode_when_standalone():
-    # Pump 2 read 0x29 after it was switched to Program
-    status = ECP150MStatus.from_bytes(with_header(0x00, 0x29))
-    assert status.is_program_mode
-    assert status.wave is Wave.SINE
+def test_values_outside_schema():
+    status = ECP150MStatus.from_bytes(with_flags(0x0E00 | 0x0180))
+    assert status.linkage is None
+    assert status.auto_mode is None
 
 
-def test_segments_stop_before_tail():
-    status = bytes(8) + bytes([6, 0, 7, 0, 2, 50, 50, 0]) * 48 + MANUAL[392:]
-    assert len(ECP150MStatus.from_bytes(status).segments) == 48
+def test_all_48_segments():
+    status = bytes(8) + bytes([6, 0, 7, 0, 2, 50, 50, 0]) * 48 + PUMP2[392:]
+    segments = ECP150MStatus.from_bytes(status).segments
+    assert [segment.index for segment in segments] == list(range(48))
+
+
+def test_unused_segments_are_skipped():
+    status = bytearray(PUMP1)
+    status[8:16] = b"\xee" * 8
+    assert [segment.index for segment in ECP150MStatus.from_bytes(bytes(status)).segments] == [1]
+
+
+def test_faults():
+    status = PUMP2[:400] + bytes([0x51])
+    faults = ECP150MStatus.from_bytes(status).faults
+    assert faults == Fault.OVERCURRENT | Fault.LOCKED_ROTOR | Fault.UART
+
+
+def test_zeroed_date_and_time():
+    status = ECP150MStatus.from_bytes(PUMP2[:392] + bytes(9))
+    assert status.date is None
+    assert status.time == datetime.time(0, 0, 0)
 
 
 def test_rejects_wrong_length():
     with pytest.raises(JebaoCommandError):
-        ECP150MStatus.from_bytes(MANUAL[:-1])
+        ECP150MStatus.from_bytes(PUMP2[:-1])
 
 
 def discovery_response(module: bytes, product_key: bytes) -> bytes:
